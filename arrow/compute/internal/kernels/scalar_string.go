@@ -232,3 +232,74 @@ func GetStartsWithKernels() []exec.ScalarKernel {
 	}
 	return kernels
 }
+
+// stringValueAt returns a function that gets the bytes of the string at
+// a given position. It works for utf8, large_utf8 and string_view spans,
+// but a string_view span must have only one data buffer.
+func stringValueAt(arr *exec.ArraySpan) func(pos int64) []byte {
+	data := arr.Buffers[2].Buf
+	switch arr.Type.ID() {
+	case arrow.STRING_VIEW:
+		views := arrow.ViewHeaderTraits.CastFromBytes(arr.Buffers[1].Buf)[arr.Offset:]
+		return func(pos int64) []byte { return viewBytes(&views[pos], data) }
+	case arrow.LARGE_STRING:
+		offsets := exec.GetSpanOffsets[int64](arr, 1)
+		return func(pos int64) []byte { return data[offsets[pos]:offsets[pos+1]] }
+	default:
+		offsets := exec.GetSpanOffsets[int32](arr, 1)
+		return func(pos int64) []byte { return data[offsets[pos]:offsets[pos+1]] }
+	}
+}
+
+// utf8Length counts characters the way Arrow C++ does: every byte that
+// isn't a UTF-8 continuation byte counts as one, and invalid input isn't
+// rejected.
+func utf8Length(v []byte) int {
+	n := 0
+	for _, b := range v {
+		if b&0xC0 != 0x80 {
+			n++
+		}
+	}
+	return n
+}
+
+func utf8LengthExec[OutT int32 | int64](_ *exec.KernelCtx, in *exec.ExecSpan, out *exec.ExecResult) error {
+	var (
+		arg0    = &in.Values[0].Array
+		valueAt = stringValueAt(arg0)
+		outData = exec.GetSpanValues[OutT](out, 1)
+		outPos  = 0
+	)
+	bitutils.VisitBitBlocks(arg0.Buffers[0].Buf, arg0.Offset, arg0.Len,
+		func(pos int64) {
+			outData[outPos] = OutT(utf8Length(valueAt(pos)))
+			outPos++
+		}, func() {
+			outData[outPos] = 0
+			outPos++
+		})
+	return nil
+}
+
+var utf8Types = []arrow.DataType{
+	arrow.BinaryTypes.String, arrow.BinaryTypes.LargeString, arrow.BinaryTypes.StringView,
+}
+
+// GetUtf8LengthKernels returns the utf8_length kernels for utf8,
+// large_utf8 and string_view input.
+func GetUtf8LengthKernels() []exec.ScalarKernel {
+	kernels := make([]exec.ScalarKernel, 0, len(utf8Types))
+	for _, ty := range utf8Types {
+		out, ex := arrow.PrimitiveTypes.Int32, utf8LengthExec[int32]
+		if ty.ID() == arrow.LARGE_STRING {
+			out, ex = arrow.PrimitiveTypes.Int64, utf8LengthExec[int64]
+		}
+		k := exec.NewScalarKernel([]exec.InputType{exec.NewExactInput(ty)},
+			exec.NewOutputType(out), ex, nil)
+		k.NullHandling = exec.NullIntersection
+		k.MemAlloc = exec.MemPrealloc
+		kernels = append(kernels, k)
+	}
+	return kernels
+}

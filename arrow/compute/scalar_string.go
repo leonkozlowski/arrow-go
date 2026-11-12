@@ -44,11 +44,22 @@ var startsWithDoc = FunctionDoc{
 	OptionsRequired: true,
 }
 
-type matchSubstringFunc struct {
+var utf8LengthDoc = FunctionDoc{
+	Summary: "Compute UTF8 string lengths",
+	Description: "For each string in \"strings\", emit its length in UTF8 characters.\n" +
+		"Null values emit null. Dictionary inputs are decoded to their value\n" +
+		"type, and extension inputs use their storage type.",
+	ArgNames: []string{"strings"},
+}
+
+// stringFunc is the function type shared by the string functions. Before
+// picking a kernel, it copies string_view input that spans several data
+// buffers into one buffer, and unwraps dictionary and extension input.
+type stringFunc struct {
 	ScalarFunction
 }
 
-func (fn *matchSubstringFunc) Execute(ctx context.Context, opts FunctionOptions, args ...Datum) (Datum, error) {
+func (fn *stringFunc) Execute(ctx context.Context, opts FunctionOptions, args ...Datum) (Datum, error) {
 	if len(args) == 1 {
 		coalesced, err := coalesceMultiBufferViewDatum(ctx, args[0])
 		if err != nil {
@@ -62,21 +73,31 @@ func (fn *matchSubstringFunc) Execute(ctx context.Context, opts FunctionOptions,
 	return execInternal(ctx, fn, opts, -1, args...)
 }
 
-func (fn *matchSubstringFunc) DispatchBest(vals ...arrow.DataType) (exec.Kernel, error) {
+func (fn *stringFunc) DispatchBest(vals ...arrow.DataType) (exec.Kernel, error) {
 	ensureDictionaryDecoded(vals...)
 	ensureNoExtensionType(vals...)
 	return fn.DispatchExact(vals...)
 }
 
-// RegisterScalarString registers the starts_with function.
+// RegisterScalarString adds the starts_with and utf8_length functions
+// to reg.
 func RegisterScalarString(reg FunctionRegistry) {
-	fn := &matchSubstringFunc{*NewScalarFunction("starts_with", Unary(), startsWithDoc)}
-	for _, k := range kernels.GetStartsWithKernels() {
-		if err := fn.AddKernel(k); err != nil {
-			panic(err)
+	for _, f := range []struct {
+		name    string
+		doc     FunctionDoc
+		kernels []exec.ScalarKernel
+	}{
+		{"starts_with", startsWithDoc, kernels.GetStartsWithKernels()},
+		{"utf8_length", utf8LengthDoc, kernels.GetUtf8LengthKernels()},
+	} {
+		fn := &stringFunc{*NewScalarFunction(f.name, Unary(), f.doc)}
+		for _, k := range f.kernels {
+			if err := fn.AddKernel(k); err != nil {
+				panic(err)
+			}
 		}
+		reg.AddFunction(fn, false)
 	}
-	reg.AddFunction(fn, false)
 }
 
 // StartsWith returns, for each value in input, whether it starts with
@@ -84,4 +105,12 @@ func RegisterScalarString(reg FunctionRegistry) {
 // to their value type, and extension inputs use their storage type.
 func StartsWith(ctx context.Context, opts MatchSubstringOptions, input Datum) (Datum, error) {
 	return CallFunction(ctx, "starts_with", &opts, input)
+}
+
+// Utf8Length returns the number of characters in each string of input.
+// Like Arrow C++, it doesn't check that the input is valid UTF-8: every
+// byte that isn't a continuation byte counts as one character. The result
+// is int64 for large_utf8 input and int32 otherwise, and nulls stay null.
+func Utf8Length(ctx context.Context, input Datum) (Datum, error) {
+	return CallFunction(ctx, "utf8_length", nil, input)
 }

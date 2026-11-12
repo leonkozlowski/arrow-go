@@ -282,3 +282,149 @@ func TestStartsWith(t *testing.T) {
 		assert.ErrorIs(t, err, arrow.ErrInvalid)
 	})
 }
+
+func newStringTestCtx(t *testing.T) (context.Context, memory.Allocator) {
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	t.Cleanup(func() { mem.AssertSize(t, 0) })
+	return compute.WithAllocator(context.Background(), mem), mem
+}
+
+func stringArrayFromJSON(t *testing.T, mem memory.Allocator, dt arrow.DataType, json string) arrow.Array {
+	arr, _, err := array.FromJSON(mem, dt, strings.NewReader(json))
+	require.NoError(t, err)
+	return arr
+}
+
+// stringArrayFromValues builds a string array from values as given, so
+// the strings can contain invalid UTF-8.
+func stringArrayFromValues(t *testing.T, mem memory.Allocator, dt arrow.DataType, values []string) arrow.Array {
+	bldr := array.NewBuilder(mem, dt)
+	defer bldr.Release()
+	bldr.(interface{ AppendStringValues([]string, []bool) }).AppendStringValues(values, nil)
+	return bldr.NewArray()
+}
+
+func checkStringUnary(t *testing.T, ctx context.Context, name string, input, expected compute.Datum) {
+	t.Helper()
+	got, err := compute.CallFunction(ctx, name, nil, input)
+	require.NoError(t, err)
+	defer got.Release()
+	assertDatumsEqual(t, expected, got, nil, nil)
+}
+
+var utf8TestTypes = []arrow.DataType{
+	arrow.BinaryTypes.String, arrow.BinaryTypes.LargeString, arrow.BinaryTypes.StringView,
+}
+
+func utf8LengthType(dt arrow.DataType) arrow.DataType {
+	if dt.ID() == arrow.LARGE_STRING {
+		return arrow.PrimitiveTypes.Int64
+	}
+	return arrow.PrimitiveTypes.Int32
+}
+
+func TestUtf8Length(t *testing.T) {
+	tests := []struct {
+		name, input, expected string
+	}{
+		{"mixed", `["", "a", "hello", null, ""]`, `[0, 1, 5, null, 0]`},
+		{"accents", `["café", "naïve", "résumé", "hello"]`, `[4, 5, 6, 5]`},
+		{"long values", `["hello world, again", "crème brûlée"]`, `[18, 12]`},
+		{"all null", `[null, null]`, `[null, null]`},
+		{"empty", `[]`, `[]`},
+	}
+
+	for _, dt := range utf8TestTypes {
+		for _, tt := range tests {
+			t.Run(dt.String()+"/"+tt.name, func(t *testing.T) {
+				ctx, mem := newStringTestCtx(t)
+				input := stringArrayFromJSON(t, mem, dt, tt.input)
+				defer input.Release()
+				expected := stringArrayFromJSON(t, mem, utf8LengthType(dt), tt.expected)
+				defer expected.Release()
+
+				in, exp := compute.NewDatumWithoutOwning(input), compute.NewDatumWithoutOwning(expected)
+				if dt.ID() == arrow.STRING_VIEW {
+					// arrow/scalar has no view scalars, so only the array path applies.
+					checkStringUnary(t, ctx, "utf8_length", in, exp)
+				} else {
+					checkScalarUnary(t, "utf8_length", in, exp, nil)
+				}
+			})
+		}
+
+		t.Run(dt.String()+"/invalid", func(t *testing.T) {
+			ctx, mem := newStringTestCtx(t)
+			// Invalid bytes are counted the same way Arrow C++ counts them.
+			input := stringArrayFromValues(t, mem, dt, []string{"\x80", "\xff", "caf\xe9", "na\xc3", "hello world, caf\xe9"})
+			defer input.Release()
+			expected := stringArrayFromJSON(t, mem, utf8LengthType(dt), `[0, 1, 4, 3, 17]`)
+			defer expected.Release()
+
+			got, err := compute.Utf8Length(ctx, compute.NewDatumWithoutOwning(input))
+			require.NoError(t, err)
+			defer got.Release()
+			assertDatumsEqual(t, compute.NewDatumWithoutOwning(expected), got, nil, nil)
+		})
+	}
+
+	for _, dt := range []arrow.DataType{arrow.BinaryTypes.String, arrow.BinaryTypes.StringView} {
+		t.Run("sliced/"+dt.String(), func(t *testing.T) {
+			ctx, mem := newStringTestCtx(t)
+			full := stringArrayFromJSON(t, mem, dt, `["apple", null, "café", "crème brûlée", null, "naïve"]`)
+			defer full.Release()
+			input := array.NewSlice(full, 1, 6)
+			defer input.Release()
+			expected := stringArrayFromJSON(t, mem, arrow.PrimitiveTypes.Int32, `[null, 4, 12, null, 5]`)
+			defer expected.Release()
+
+			checkStringUnary(t, ctx, "utf8_length",
+				compute.NewDatumWithoutOwning(input), compute.NewDatumWithoutOwning(expected))
+		})
+	}
+
+	t.Run("multi-buffer view", func(t *testing.T) {
+		ctx, mem := newStringTestCtx(t)
+		long := strings.Repeat("café ", 4000)
+		bldr := array.NewStringViewBuilder(mem)
+		defer bldr.Release()
+		for _, v := range []string{"one " + long, "two " + long, "three", "four " + long} {
+			bldr.Append(v)
+		}
+		bldr.AppendNull()
+		full := bldr.NewArray()
+		defer full.Release()
+		require.Greater(t, len(full.Data().Buffers()), 3)
+		input := array.NewSlice(full, 1, 5)
+		defer input.Release()
+		expected := stringArrayFromJSON(t, mem, arrow.PrimitiveTypes.Int32, `[20004, 5, 20005, null]`)
+		defer expected.Release()
+
+		checkStringUnary(t, ctx, "utf8_length",
+			compute.NewDatumWithoutOwning(input), compute.NewDatumWithoutOwning(expected))
+	})
+
+	t.Run("dictionary", func(t *testing.T) {
+		ctx, mem := newStringTestCtx(t)
+		dict := stringArrayFromJSON(t, mem, arrow.BinaryTypes.String, `["apple", null, "café"]`)
+		defer dict.Release()
+		indices := stringArrayFromJSON(t, mem, arrow.PrimitiveTypes.Int8, `[0, 1, 2, null, 0]`)
+		defer indices.Release()
+		input := array.NewDictionaryArray(&arrow.DictionaryType{
+			IndexType: arrow.PrimitiveTypes.Int8, ValueType: arrow.BinaryTypes.String}, indices, dict)
+		defer input.Release()
+		expected := stringArrayFromJSON(t, mem, arrow.PrimitiveTypes.Int32, `[5, null, 4, null, 5]`)
+		defer expected.Release()
+
+		checkStringUnary(t, ctx, "utf8_length",
+			compute.NewDatumWithoutOwning(input), compute.NewDatumWithoutOwning(expected))
+	})
+
+	t.Run("binary input", func(t *testing.T) {
+		ctx, mem := newStringTestCtx(t)
+		bin := stringArrayFromJSON(t, mem, arrow.BinaryTypes.Binary, `["YQ=="]`)
+		defer bin.Release()
+		_, err := compute.Utf8Length(ctx, compute.NewDatumWithoutOwning(bin))
+		assert.ErrorIs(t, err, arrow.ErrNotImplemented)
+	})
+}
